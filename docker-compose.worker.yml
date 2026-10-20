@@ -1,0 +1,21 @@
+# Run this on a dedicated Linux VM with Docker Engine installed.
+# The worker has access to the host Docker socket; never run it on a shared host.
+services:
+  andro-worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    image: andro-android-runner:latest
+    restart: unless-stopped
+    env_file: .env.worker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/andro-work:/var/lib/andro-work:rw
+    environment:
+      ANDRO_RUNNER_IMAGE: andro-android-runner:latest
+      ANDRO_WORK_ROOT: /var/lib/andro-work
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,nosuid,nodev
+    security_opt:
+      - no-new-privileges:true

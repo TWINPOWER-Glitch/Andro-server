@@ -1,0 +1,11 @@
+{
+  "name": "andro-server",
+  "version": "0.2.0",
+  "private": true,
+  "engines": { "node": ">=22" },
+  "description": "Andro durable build queue, API/MCP gateway, and Android worker",
+  "type": "module",
+  "scripts": {"dev":"tsx watch src/start.ts", "build":"tsc -p tsconfig.json", "start":"node dist/start.js", "worker":"node dist/worker.js", "check":"tsc --noEmit -p tsconfig.json"},
+  "dependencies": {"@modelcontextprotocol/sdk":"^1.12.1", "cors":"^2.8.5", "dotenv":"^16.4.7", "express":"^4.21.2", "pg":"^8.16.3", "@supabase/supabase-js":"^2.57.0", "zod":"^3.24.2"},
+  "devDependencies": {"@types/cors":"^2.8.17", "@types/express":"^5.0.1", "@types/node":"^22.13.10", "@types/pg":"^8.15.5", "tsx":"^4.19.3", "typescript":"^5.8.2"}
+}
