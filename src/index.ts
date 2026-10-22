@@ -27,6 +27,9 @@ function secureToken(req: Request, res: Response, next: NextFunction, expected: 
 }
 const apiKey = (req: Request,res: Response,next: NextFunction) => secureToken(req,res,next,process.env.ANDRO_API_KEY,'API key is not configured. Set ANDRO_API_KEY before exposing this server.');
 const workerKey = (req: Request,res: Response,next: NextFunction) => secureToken(req,res,next,process.env.ANDRO_WORKER_TOKEN,'Worker token is not configured.');
+function asStringParam(value: string | string[]): string {
+  return Array.isArray(value) ? (value[0] ?? '') : value;
+}
 
 app.get('/health', async (_req,res) => {
   try { await pool.query('SELECT 1'); res.json({service:'andro-server',status:'ok',database:'connected',time:new Date().toISOString()}); }
