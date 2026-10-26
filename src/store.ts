@@ -34,8 +34,8 @@ MIIDxDCCAqygAwIBAgIUbLxMod62P2ktCiAkxnKJwtE9VPYwDQYJKoZIhvcNAQEL
 BQAwazELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5l
 dyBDYXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJh
 c2UgUm9vdCAyMDIxIENBMB4XDTIxMDQyODEwNTY1M1oXDTMxMDQyNjEwNTY1M1ow
-azELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5ldyBD
-YXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJhc2Ug
+azELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5l
+dyBDYXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJhc2Ug
 Um9vdCAyMDIxIENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqQXW
 QyHOB+qR2GJobCq/CBmQ40G0oDmCC3mzVnn8sv4XNeWtE5XcEL0uVih7Jo4Dkx1Q
 DmGHBH1zDfgs2qXiLb6xpw/CKQPypZW1JssOTMIfQppNQ87K75Ya0p25Y3ePS2t2
@@ -54,16 +54,17 @@ o/bKiIz+Fq8=
 -----END CERTIFICATE-----`;
 
 /**
- * Prefer PostgreSQL URLs supplied by the Supabase integration,
- * falling back to DATABASE_URL.
+ * Prefer the explicitly configured Andro DATABASE_URL.
+ * Supabase integration URLs are fallbacks because they can point
+ * to a different linked project.
  *
  * Never log connection URLs because they can contain credentials.
  */
 const databaseUrlCandidates = [
+  process.env.DATABASE_URL,
   process.env.SUPABAS_POSTGRES_URL,
   process.env.SUPABAS_POSTGRES_PRISMA_URL,
   process.env.SUPABAS_POSTGRES_URL_NON_POOLING,
-  process.env.DATABASE_URL,
 ];
 
 const rawConnectionString = databaseUrlCandidates.find(
@@ -80,8 +81,8 @@ if (!rawConnectionString) {
 
 /**
  * Remove SSL-related URL parameters before supplying explicit TLS
- * options. node-postgres can otherwise let connection-string options
- * override the SSL object, including its CA certificate.
+ * options. This prevents connection-string options from overriding
+ * the configured CA certificate and verification settings.
  */
 const parsedConnectionUrl = new URL(rawConnectionString);
 
