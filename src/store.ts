@@ -22,10 +22,10 @@ export interface BuildJob {
 }
 
 /**
- * Prefer the PostgreSQL connection URLs supplied by the Supabase
- * integration, falling back to DATABASE_URL.
+ * Prefer PostgreSQL URLs supplied by the Supabase integration,
+ * falling back to DATABASE_URL.
  *
- * Do not log connection URLs because they can contain credentials.
+ * Never log connection URLs because they can contain credentials.
  */
 const databaseUrlCandidates = [
   process.env.SUPABAS_POSTGRES_URL,
@@ -34,17 +34,38 @@ const databaseUrlCandidates = [
   process.env.DATABASE_URL,
 ];
 
-const connectionString = databaseUrlCandidates.find(
+const rawConnectionString = databaseUrlCandidates.find(
   (value): value is string =>
     typeof value === 'string' &&
     /^postgres(?:ql)?:\/\//i.test(value.trim()),
 )?.trim();
 
-if (!connectionString) {
+if (!rawConnectionString) {
   throw new Error(
     'A valid PostgreSQL connection URL is required. Configure DATABASE_URL or a Supabase PostgreSQL URL in Vercel.',
   );
 }
+
+/**
+ * node-postgres can allow SSL parameters in the connection URL
+ * to override the explicit SSL configuration.
+ *
+ * Remove URL SSL parameters so DATABASE_SSL and
+ * DATABASE_SSL_STRICT control the connection settings.
+ * Preserve credentials and all non-SSL query parameters.
+ */
+const parsedConnectionUrl = new URL(rawConnectionString);
+
+for (const parameter of [
+  'sslmode',
+  'sslcert',
+  'sslkey',
+  'sslrootcert',
+]) {
+  parsedConnectionUrl.searchParams.delete(parameter);
+}
+
+const connectionString = parsedConnectionUrl.toString();
 
 export const pool = new Pool({
   connectionString,
