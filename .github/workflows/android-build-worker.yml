@@ -14,7 +14,9 @@ concurrency:
 
 jobs:
   claim:
+    if: ${{ always() }}
     runs-on: ubuntu-latest
+
     outputs:
       has_job: ${{ steps.claim.outputs.has_job }}
       job_id: ${{ steps.claim.outputs.job_id }}
@@ -24,6 +26,24 @@ jobs:
       android_platform: ${{ steps.claim.outputs.android_platform }}
 
     steps:
+      - name: Validate worker configuration
+        env:
+          ANDRO_SERVER_URL: ${{ secrets.ANDRO_SERVER_URL }}
+          ANDRO_WORKER_TOKEN: ${{ secrets.ANDRO_WORKER_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ANDRO_SERVER_URL:-}" ]]; then
+            echo "::error::The ANDRO_SERVER_URL secret is missing."
+            exit 1
+          fi
+
+          if [[ -z "${ANDRO_WORKER_TOKEN:-}" ]]; then
+            echo "::error::The ANDRO_WORKER_TOKEN secret is missing."
+            exit 1
+          fi
+
       - name: Claim one queued build
         id: claim
         env:
@@ -33,61 +53,69 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -z "${ANDRO_SERVER_URL:-}" || -z "${ANDRO_WORKER_TOKEN:-}" ]]; then
-            echo "::error::Configure ANDRO_SERVER_URL and ANDRO_WORKER_TOKEN."
-            exit 1
-          fi
-
           curl --fail-with-body --silent --show-error \
+            --connect-timeout 15 \
+            --max-time 60 \
             -X POST "${ANDRO_SERVER_URL%/}/internal/worker/claim" \
             -H "Authorization: Bearer ${ANDRO_WORKER_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d '{}' > "$RUNNER_TEMP/claim.json"
+            -d '{}' \
+            -o "$RUNNER_TEMP/claim.json"
 
           node <<'NODE'
           const fs = require('fs');
-          const data = JSON.parse(
-            fs.readFileSync(process.env.RUNNER_TEMP + '/claim.json', 'utf8')
-          );
-          const job = data.job;
+
+          const file = process.env.RUNNER_TEMP + '/claim.json';
+          const data = JSON.parse(fs.readFileSync(file, 'utf8'));
           const output = process.env.GITHUB_OUTPUT;
+          const job = data.job;
 
           if (!job) {
             fs.appendFileSync(output, 'has_job=false\n');
-          } else {
-            const values = {
-              has_job: 'true',
-              job_id: job.id,
-              repo_url: job.repoUrl,
-              ref: job.ref || 'main',
-              gradle_task: job.task || 'assembleDebug',
-              android_platform: String(job.androidPlatform || 36)
-            };
-
-            for (const [key, value] of Object.entries(values)) {
-              const text = String(value);
-              if (/[\r\n]/.test(text)) {
-                throw new Error(`Invalid newline in ${key}`);
-              }
-              fs.appendFileSync(output, `${key}=${text}\n`);
-            }
+            console.log('No queued Andro build jobs.');
+            process.exit(0);
           }
+
+          const values = {
+            has_job: 'true',
+            job_id: job.id,
+            repo_url: job.repoUrl,
+            ref: job.ref || 'main',
+            gradle_task: job.task || 'assembleDebug',
+            android_platform: String(job.androidPlatform || 36)
+          };
+
+          for (const [key, value] of Object.entries(values)) {
+            if (value === undefined || value === null || String(value).trim() === '') {
+              throw new Error(`Claimed job is missing required field: ${key}`);
+            }
+
+            const text = String(value);
+
+            if (/[\r\n]/.test(text)) {
+              throw new Error(`Invalid newline in ${key}`);
+            }
+
+            fs.appendFileSync(output, `${key}=${text}\n`);
+          }
+
+          console.log(`Claimed build job ${values.job_id}.`);
           NODE
 
       - name: Report empty queue
         if: steps.claim.outputs.has_job != 'true'
-        run: echo "No queued Andro build jobs."
+        run: echo "Claim completed successfully; no queued builds were available."
 
   build:
     needs: claim
-    if: needs.claim.outputs.has_job == 'true'
+    if: ${{ needs.claim.result == 'success' && needs.claim.outputs.has_job == 'true' }}
     runs-on: ubuntu-latest
 
     outputs:
       build_result: ${{ steps.compile.outputs.build_result }}
 
     steps:
-      - name: Validate and checkout requested project
+      - name: Validate requested repository
         env:
           REPO_URL: ${{ needs.claim.outputs.repo_url }}
           PROJECT_REF: ${{ needs.claim.outputs.ref }}
@@ -95,14 +123,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Only public HTTPS Git repositories are accepted.
-          node -e '
-            const u = new URL(process.env.REPO_URL);
-            if (u.protocol !== "https:" || u.hostname !== "github.com") {
-              throw new Error("Only HTTPS repositories hosted on github.com are supported.");
-            }
-          '
+          node <<'NODE'
+          const url = new URL(process.env.REPO_URL);
 
+          if (url.protocol !== 'https:' || url.hostname !== 'github.com') {
+            throw new Error(
+              'Only HTTPS repositories hosted on github.com are supported.'
+            );
+          }
+
+          if (!process.env.PROJECT_REF ||
+              /[\r\n]/.test(process.env.PROJECT_REF)) {
+            throw new Error('Invalid project Git reference.');
+          }
+          NODE
+
+      - name: Checkout requested project
+        env:
+          REPO_URL: ${{ needs.claim.outputs.repo_url }}
+          PROJECT_REF: ${{ needs.claim.outputs.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
           git clone --depth 1 --branch "$PROJECT_REF" "$REPO_URL" project
 
       - name: Set up Java
@@ -117,8 +159,15 @@ jobs:
       - name: Install Android SDK packages
         env:
           ANDROID_PLATFORM: ${{ needs.claim.outputs.android_platform }}
+        shell: bash
         run: |
           set -euo pipefail
+
+          if ! [[ "$ANDROID_PLATFORM" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid Android platform: $ANDROID_PLATFORM"
+            exit 1
+          fi
+
           sdkmanager \
             "platform-tools" \
             "platforms;android-${ANDROID_PLATFORM}" \
@@ -131,11 +180,21 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+
           mkdir -p "$RUNNER_TEMP/andro-output"
+          : > "$RUNNER_TEMP/gradle.log"
 
           if [[ ! -f project/gradlew ]]; then
             echo "build_result=failure" >> "$GITHUB_OUTPUT"
-            echo "Gradle wrapper was not found." > "$RUNNER_TEMP/build-error.txt"
+            echo "Gradle wrapper was not found." \
+              > "$RUNNER_TEMP/build-error.txt"
+            exit 0
+          fi
+
+          if [[ ! "$GRADLE_TASK" =~ ^[A-Za-z0-9:_-]+$ ]]; then
+            echo "build_result=failure" >> "$GITHUB_OUTPUT"
+            echo "Invalid Gradle task." \
+              > "$RUNNER_TEMP/build-error.txt"
             exit 0
           fi
 
@@ -160,7 +219,7 @@ jobs:
           fi
 
       - name: Upload temporary build output
-        if: always()
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: andro-build-${{ needs.claim.outputs.job_id }}
@@ -173,7 +232,7 @@ jobs:
 
   report:
     needs: [claim, build]
-    if: always() && needs.claim.outputs.has_job == 'true'
+    if: ${{ always() && needs.claim.result == 'success' && needs.claim.outputs.has_job == 'true' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -196,6 +255,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ -z "${ANDRO_SERVER_URL:-}" ||
+                -z "${ANDRO_WORKER_TOKEN:-}" ||
+                -z "${JOB_ID:-}" ]]; then
+            echo "::error::Required Andro reporting configuration is missing."
+            exit 1
+          fi
+
           status="failed"
           error_message="Android build failed. Inspect the GitHub Actions logs."
           artifact_path=""
@@ -209,8 +275,14 @@ jobs:
             \( -name '*.apk' -o -name '*.aab' \) \
             -print -quit 2>/dev/null || true)"
 
+          if [[ "$status" == "succeeded" && -z "$artifact" ]]; then
+            status="failed"
+            error_message="Build reported success, but no APK or AAB artifact was found."
+          fi
+
           if [[ -n "$artifact" ]]; then
-            if [[ -z "${SUPABASE_URL:-}" || -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
+            if [[ -z "${SUPABASE_URL:-}" ||
+                  -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
               status="failed"
               error_message="Supabase Storage secrets are missing."
             else
@@ -224,6 +296,8 @@ jobs:
               ' "$artifact_path")"
 
               curl --fail-with-body --silent --show-error \
+                --connect-timeout 15 \
+                --max-time 300 \
                 -X POST \
                 "${SUPABASE_URL%/}/storage/v1/object/andro-artifacts/$encoded_path" \
                 -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
@@ -242,6 +316,8 @@ jobs:
           ' "$status" "$artifact_path" "$error_message")"
 
           curl --fail-with-body --silent --show-error \
+            --connect-timeout 15 \
+            --max-time 60 \
             -X POST \
             "${ANDRO_SERVER_URL%/}/internal/jobs/$JOB_ID/status" \
             -H "Authorization: Bearer $ANDRO_WORKER_TOKEN" \
