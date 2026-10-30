@@ -12,7 +12,7 @@ on:
       - "package.json"
       - "package-lock.json"
       - "tsconfig.json"
-      - ".github/workflows/andro-docker-worker-check.yml"
+      - ".github/workflows/ndro-docker-worker-check.yml"
 
   pull_request:
     paths:
