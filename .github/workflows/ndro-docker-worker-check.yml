@@ -1,0 +1,59 @@
+
+name: Andro Docker Worker Verification
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "worker/**"
+      - "src/worker.ts"
+      - "src/store.ts"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - ".github/workflows/andro-docker-worker-check.yml"
+
+  pull_request:
+    paths:
+      - "worker/**"
+      - "src/worker.ts"
+      - "src/store.ts"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: andro-docker-worker-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-worker-image:
+    name: Build Android Worker Docker Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Andro Android worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/Dockerfile
+          push: false
+          tags: andro-android-runner:verification
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verification completed
+        run: echo "Andro Android worker Docker image built successfully."
