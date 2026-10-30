@@ -6,14 +6,24 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ANDROID_HOME=/opt/android-sdk \
     ANDROID_SDK_ROOT=/opt/android-sdk \
     JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
-    PATH=/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/build-tools/36.1.0:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    GRADLE_VERSION=8.13 \
+    PATH=/opt/gradle/gradle-8.13/bin:/opt/android-sdk/cmdline-tools/latest/bin:/opt/android-sdk/platform-tools:/opt/android-sdk/build-tools/36.1.0:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Docker CLI is required to launch isolated Android build containers.
+# Install Java, Docker CLI, Git and utilities.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        bash ca-certificates curl docker.io git \
        openjdk-17-jdk-headless unzip zip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Gradle 8.13 for projects that do not include gradlew.
+RUN mkdir -p /opt/gradle \
+    && curl -fL --retry 3 \
+       "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
+       -o /tmp/gradle.zip \
+    && unzip -q /tmp/gradle.zip -d /opt/gradle \
+    && rm /tmp/gradle.zip \
+    && gradle --version
 
 # Install Android SDK command-line tools and required Android 36 packages.
 RUN mkdir -p "${ANDROID_HOME}/cmdline-tools" /tmp/android-cmdline-tools \
@@ -28,19 +38,20 @@ RUN mkdir -p "${ANDROID_HOME}/cmdline-tools" /tmp/android-cmdline-tools \
        "platform-tools" \
        "platforms;android-36" \
        "build-tools;36.1.0" \
-    && chmod -R a+rX "${ANDROID_HOME}"
+    && chmod -R a+rX "${ANDROID_HOME}" \
+    && chmod -R a+rX /opt/gradle
 
 WORKDIR /app
 
 COPY package*.json ./
 
-# Explicitly include TypeScript and other dev dependencies for compilation.
+# Include development dependencies for TypeScript compilation.
 RUN npm install --include=dev
 
 COPY tsconfig.json ./
 COPY src ./src
 
-# Compile the worker, then remove development dependencies from the image.
+# Compile the trusted worker, then remove development dependencies.
 RUN npm run build \
     && npm prune --omit=dev
 
