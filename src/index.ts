@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import express, {
   type Request,
@@ -20,8 +19,14 @@ import {
 import { createClient } from '@supabase/supabase-js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import {
+  createOAuthRouter,
+  OAUTH_ISSUER,
+  OAUTH_RESOURCE,
+  verifyOAuthAccessToken,
+} from './oauth.js';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseSecret =
@@ -51,6 +56,11 @@ app.use(
 );
 
 app.use(express.json({ limit: '1mb' }));
+
+// OAuth discovery, registration, GitHub sign-in, consent, token,
+// refresh, and revocation endpoints. The existing API-key routes remain
+// unchanged; only the MCP endpoint accepts either API-key or OAuth auth.
+app.use(createOAuthRouter());
 
 function paramString(
   value: string | string[] | undefined,
@@ -108,6 +118,73 @@ const workerKey = (
     process.env.ANDRO_WORKER_TOKEN,
     'Worker token is not configured.',
   );
+
+/**
+ * MCP keeps the existing API-key path operational while adding OAuth.
+ * API-key requests retain the existing full access. OAuth requests must
+ * present a live, resource-bound access token from the OAuth tables.
+ */
+const mcpAuth = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) => {
+  const provided =
+    req.header('authorization')?.replace(/^Bearer\s+/i, '') ?? '';
+  const expected = process.env.ANDRO_API_KEY;
+
+  if (expected) {
+    const suppliedBytes = Buffer.from(provided);
+    const expectedBytes = Buffer.from(expected);
+    if (
+      suppliedBytes.length === expectedBytes.length &&
+      timingSafeEqual(suppliedBytes, expectedBytes)
+    ) {
+      res.locals.androApiKeyAuthorized = true;
+      res.locals.androOAuthScopes = [];
+      return next();
+    }
+  }
+
+  if (!provided) {
+    res.set(
+      'WWW-Authenticate',
+      `Bearer realm="andro", resource_metadata="${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="mcp:read mcp:build"`,
+    );
+    return res.status(401).json({
+      error: 'Unauthorized',
+      error_description: 'A valid Andro API key or OAuth access token is required.',
+    });
+  }
+
+  try {
+    const authorization = await verifyOAuthAccessToken(
+      provided,
+      OAUTH_RESOURCE,
+    );
+
+    if (!authorization) {
+      res.set(
+        'WWW-Authenticate',
+        `Bearer realm="andro", error="invalid_token", resource_metadata="${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="mcp:read mcp:build"`,
+      );
+      return res.status(401).json({ error: 'Invalid or expired access token.' });
+    }
+
+    res.locals.androApiKeyAuthorized = false;
+    res.locals.androOAuthScopes = authorization.scopes;
+    res.locals.androOAuthClientId = authorization.clientId;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+};
+
+function mcpHasScope(res: Response, scope: 'mcp:read' | 'mcp:build') {
+  if (res.locals.androApiKeyAuthorized === true) return true;
+  const scopes = res.locals.androOAuthScopes as string[] | undefined;
+  return Array.isArray(scopes) && scopes.includes(scope);
+}
 
 // Health check. Never expose database connection details.
 app.get('/health', async (_req, res) => {
@@ -497,232 +574,238 @@ function mcpError(message: string, details?: unknown) {
 }
 
 // MCP endpoint. Each request gets a fresh stateless server and transport.
-app.post('/mcp', apiKey, async (req, res) => {
+// API-key callers retain all existing tools. OAuth callers only receive
+// tools allowed by their granted scopes.
+app.post('/mcp', mcpAuth, async (req, res) => {
   const server = new McpServer({
     name: 'andro',
     version: VERSION,
   });
 
-  server.tool(
-    'andro_create_build',
-    'Submit an Android Gradle build for a public GitHub, GitLab, or Bitbucket repository. Returns a job ID; the build must still be executed by a registered worker.',
-    {
-      projectId: z.string().min(1).max(128).optional(),
-      repoUrl: z.string().url(),
-      ref: z.string().optional(),
-      task: z.string().optional(),
-      javaVersion: z.enum(['17']).optional(),
-      androidPlatform: z.enum(['36']).optional(),
-    },
-    async (args) => {
-      const parsed = buildSchema.safeParse(args);
+  if (mcpHasScope(res, 'mcp:build')) {
+    server.tool(
+      'andro_create_build',
+      'Submit an Android Gradle build for a public GitHub, GitLab, or Bitbucket repository. Returns a job ID; the build must still be executed by a registered worker.',
+      {
+        projectId: z.string().min(1).max(128).optional(),
+        repoUrl: z.string().url(),
+        ref: z.string().optional(),
+        task: z.string().optional(),
+        javaVersion: z.enum(['17']).optional(),
+        androidPlatform: z.enum(['36']).optional(),
+      },
+      async (args) => {
+        const parsed = buildSchema.safeParse(args);
 
-      if (!parsed.success) {
-        return mcpError(
-          'Invalid build request',
-          parsed.error.flatten(),
-        );
-      }
-
-      try {
-        const job = await createJob(parsed.data);
-
-        return mcpText({
-          job,
-          warning:
-            'The job is queued. A worker must execute Gradle before the build can succeed.',
-        });
-      } catch {
-        return mcpError(
-          'Could not create the build job. Check database availability.',
-        );
-      }
-    },
-  );
-
-  server.tool(
-    'andro_get_build',
-    'Get the status and metadata for a specific build job using its UUID.',
-    {
-      jobId: z.string().uuid(),
-    },
-    async ({ jobId }) => {
-      try {
-        const job = await getJob(jobId);
-
-        return job
-          ? mcpText({ job })
-          : mcpError('Build job not found', { jobId });
-      } catch {
-        return mcpError(
-          'Could not retrieve build status.',
-        );
-      }
-    },
-  );
-
-  server.tool(
-    'andro_list_builds',
-    'List recent Andro build jobs, including their status and available metadata.',
-    {},
-    async () => {
-      try {
-        const jobs = await listJobs();
-
-        return mcpText({
-          count: jobs.length,
-          jobs: jobs.slice(0, 50),
-        });
-      } catch {
-        return mcpError(
-          'Could not retrieve the build list.',
-        );
-      }
-    },
-  );
-
-  server.tool(
-    'andro_get_build_logs',
-    'Retrieve the persisted log lines and error information for a build job.',
-    {
-      jobId: z.string().uuid(),
-    },
-    async ({ jobId }) => {
-      try {
-        const job = await getJob(jobId);
-
-        if (!job) {
+        if (!parsed.success) {
           return mcpError(
-            'Build job not found',
-            { jobId },
+            'Invalid build request',
+            parsed.error.flatten(),
           );
         }
 
-        return mcpText({
-          jobId: job.id,
-          status: job.status,
-          logs: job.logs,
-          error: job.error ?? null,
-        });
-      } catch {
-        return mcpError(
-          'Unable to retrieve build logs.',
-        );
-      }
-    },
-  );
+        try {
+          const job = await createJob(parsed.data);
 
-  server.tool(
-    'andro_get_build_artifact',
-    'Generate a temporary download link for the APK/AAB from a successfully completed build. The link expires after five minutes.',
-    {
-      jobId: z.string().uuid(),
-    },
-    async ({ jobId }) => {
-      try {
-        if (!storage) {
-          return mcpError(
-            'Artifact storage is not configured.',
-          );
-        }
-
-        const job = await getJob(jobId);
-
-        if (!job) {
-          return mcpError(
-            'Build job not found',
-            { jobId },
-          );
-        }
-
-        if (
-          job.status !== 'succeeded' ||
-          !job.artifactPath
-        ) {
-          return mcpError(
-            'No downloadable APK/AAB artifact is available.',
-            {
-              status: job.status,
-              hint:
-                'Inspect the build status and logs. A successful Gradle task does not guarantee that an APK/AAB was produced.',
-            },
-          );
-        }
-
-        const { data, error } = await storage.storage
-          .from(artifactBucket)
-          .createSignedUrl(job.artifactPath, 300, {
-            download: true,
+          return mcpText({
+            job,
+            warning:
+              'The job is queued. A worker must execute Gradle before the build can succeed.',
           });
-
-        if (error || !data?.signedUrl) {
+        } catch {
           return mcpError(
-            'Could not create a temporary artifact download link.',
+            'Could not create the build job. Check database availability.',
           );
+        }
+      },
+    );
+  }
+
+  if (mcpHasScope(res, 'mcp:read')) {
+    server.tool(
+      'andro_get_build',
+      'Get the status and metadata for a specific build job using its UUID.',
+      {
+        jobId: z.string().uuid(),
+      },
+      async ({ jobId }) => {
+        try {
+          const job = await getJob(jobId);
+
+          return job
+            ? mcpText({ job })
+            : mcpError('Build job not found', { jobId });
+        } catch {
+          return mcpError(
+            'Could not retrieve build status.',
+          );
+        }
+      },
+    );
+
+    server.tool(
+      'andro_list_builds',
+      'List recent Andro build jobs, including their status and available metadata.',
+      {},
+      async () => {
+        try {
+          const jobs = await listJobs();
+
+          return mcpText({
+            count: jobs.length,
+            jobs: jobs.slice(0, 50),
+          });
+        } catch {
+          return mcpError(
+            'Could not retrieve the build list.',
+          );
+        }
+      },
+    );
+
+    server.tool(
+      'andro_get_build_logs',
+      'Retrieve the persisted log lines and error information for a build job.',
+      {
+        jobId: z.string().uuid(),
+      },
+      async ({ jobId }) => {
+        try {
+          const job = await getJob(jobId);
+
+          if (!job) {
+            return mcpError(
+              'Build job not found',
+              { jobId },
+            );
+          }
+
+          return mcpText({
+            jobId: job.id,
+            status: job.status,
+            logs: job.logs,
+            error: job.error ?? null,
+          });
+        } catch {
+          return mcpError(
+            'Unable to retrieve build logs.',
+          );
+        }
+      },
+    );
+
+    server.tool(
+      'andro_get_build_artifact',
+      'Generate a temporary download link for the APK/AAB from a successfully completed build. The link expires after five minutes.',
+      {
+        jobId: z.string().uuid(),
+      },
+      async ({ jobId }) => {
+        try {
+          if (!storage) {
+            return mcpError(
+              'Artifact storage is not configured.',
+            );
+          }
+
+          const job = await getJob(jobId);
+
+          if (!job) {
+            return mcpError(
+              'Build job not found',
+              { jobId },
+            );
+          }
+
+          if (
+            job.status !== 'succeeded' ||
+            !job.artifactPath
+          ) {
+            return mcpError(
+              'No downloadable APK/AAB artifact is available.',
+              {
+                status: job.status,
+                hint:
+                  'Inspect the build status and logs. A successful Gradle task does not guarantee that an APK/AAB was produced.',
+              },
+            );
+          }
+
+          const { data, error } = await storage.storage
+            .from(artifactBucket)
+            .createSignedUrl(job.artifactPath, 300, {
+              download: true,
+            });
+
+          if (error || !data?.signedUrl) {
+            return mcpError(
+              'Could not create a temporary artifact download link.',
+            );
+          }
+
+          return mcpText({
+            jobId: job.id,
+            status: job.status,
+            expiresInSeconds: 300,
+            downloadUrl: data.signedUrl,
+          });
+        } catch {
+          return mcpError(
+            'Unable to create an artifact download link.',
+          );
+        }
+      },
+    );
+
+    server.tool(
+      'andro_get_server_status',
+      'Check Andro database connectivity and configured capabilities without revealing credentials. This does not prove that a worker is online.',
+      {},
+      async () => {
+        let database = 'unavailable';
+
+        try {
+          await pool.query('SELECT 1');
+          database = 'connected';
+        } catch {
+          // Do not expose database errors or connection details.
         }
 
         return mcpText({
-          jobId: job.id,
-          status: job.status,
-          expiresInSeconds: 300,
-          downloadUrl: data.signedUrl,
+          service: 'andro-server',
+          version: VERSION,
+          database,
+          workerTokenConfigured: Boolean(
+            process.env.ANDRO_WORKER_TOKEN,
+          ),
+          artifactStorageConfigured: Boolean(storage),
+          artifactBucket,
+          supportedRepositoryHosts: [
+            'github.com',
+            'gitlab.com',
+            'bitbucket.org',
+          ],
+          supportedJavaVersions: ['17'],
+          supportedAndroidPlatforms: ['36'],
+          tools: [
+            ...(mcpHasScope(res, 'mcp:build') ? ['andro_create_build'] : []),
+            'andro_get_build',
+            'andro_list_builds',
+            'andro_get_build_logs',
+            'andro_get_build_artifact',
+            'andro_get_server_status',
+          ],
+          limitations: [
+            'Only public Git repositories are supported.',
+            'A queued job requires a registered worker.',
+            'Project file editing is not implemented.',
+            'Automated repair loops are not implemented.',
+            'Emulator and instrumentation testing are not implemented.',
+          ],
         });
-      } catch {
-        return mcpError(
-          'Unable to create an artifact download link.',
-        );
-      }
-    },
-  );
-
-  server.tool(
-    'andro_get_server_status',
-    'Check Andro database connectivity and configured capabilities without revealing credentials. This does not prove that a worker is online.',
-    {},
-    async () => {
-      let database = 'unavailable';
-
-      try {
-        await pool.query('SELECT 1');
-        database = 'connected';
-      } catch {
-        // Do not expose database errors or connection details.
-      }
-
-      return mcpText({
-        service: 'andro-server',
-        version: VERSION,
-        database,
-        workerTokenConfigured: Boolean(
-          process.env.ANDRO_WORKER_TOKEN,
-        ),
-        artifactStorageConfigured: Boolean(storage),
-        artifactBucket,
-        supportedRepositoryHosts: [
-          'github.com',
-          'gitlab.com',
-          'bitbucket.org',
-        ],
-        supportedJavaVersions: ['17'],
-        supportedAndroidPlatforms: ['36'],
-        tools: [
-          'andro_create_build',
-          'andro_get_build',
-          'andro_list_builds',
-          'andro_get_build_logs',
-          'andro_get_build_artifact',
-          'andro_get_server_status',
-        ],
-        limitations: [
-          'Only public Git repositories are supported.',
-          'A queued job requires a registered worker.',
-          'Project file editing is not implemented.',
-          'Automated repair loops are not implemented.',
-          'Emulator and instrumentation testing are not implemented.',
-        ],
-      });
-    },
-  );
+      },
+    );
+  }
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
