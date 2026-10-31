@@ -184,6 +184,22 @@ function logLoginTransactionTrace(
   });
 }
 
+/*
+ * OAuth token-exchange diagnostics.
+ *
+ * Only stage, outcome and a non-reversible database fingerprint
+ * are recorded. Never log authorization codes, PKCE verifiers,
+ * PKCE challenges, client IDs, access tokens, refresh tokens,
+ * request bodies, or credential values.
+ */
+function logOAuthTokenTrace(stage: string, outcome: string) {
+  console.info('[oauth] token exchange trace', {
+    stage,
+    outcome,
+    database: oauthDatabaseTargetFingerprint(),
+  });
+}
+
 function isGithubOAuthConfigured(): boolean {
   return Boolean(
     process.env.GITHUB_CLIENT_ID?.trim() &&
@@ -894,14 +910,32 @@ export function createOAuthRouter(): Router {
   });
 
   router.post('/oauth/token', async (req, res) => {
-    const body = req.body as Record<string, unknown>;
+    const body = (req.body ?? {}) as Record<string, unknown>;
     const grantType = stringValue(body.grant_type);
     const clientId = stringValue(body.client_id);
     const resource = stringValue(body.resource);
+    let diagnosticStage = 'token_request';
 
-    if (!clientId || resource !== OAUTH_RESOURCE) {
+    const contentType =
+      req.is('application/x-www-form-urlencoded') ? 'form' :
+      req.is('application/json') ? 'json' : 'other';
+
+    logOAuthTokenTrace(
+      'token_request',
+      `received_${contentType}_${grantType === 'authorization_code' || grantType === 'refresh_token' ? grantType : 'other_grant'}`,
+    );
+
+    if (!clientId) {
+      logOAuthTokenTrace('token_client_validation', 'missing_client_id');
       return oauthError(res, 400, 'invalid_request');
     }
+    logOAuthTokenTrace('token_client_validation', 'client_id_present');
+
+    if (resource !== OAUTH_RESOURCE) {
+      logOAuthTokenTrace('token_resource_validation', 'request_resource_mismatch');
+      return oauthError(res, 400, 'invalid_request');
+    }
+    logOAuthTokenTrace('token_resource_validation', 'request_resource_matched');
 
     let db: any;
 
@@ -914,21 +948,26 @@ export function createOAuthRouter(): Router {
         const redirectUri = stringValue(body.redirect_uri);
         const verifier = stringValue(body.code_verifier);
 
-        if (
-          !code ||
-          !redirectUri ||
-          !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)
-        ) {
+        diagnosticStage = 'token_request_validation';
+        if (!code || !redirectUri || !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) {
+          logOAuthTokenTrace('token_request_validation', 'missing_or_invalid_code_redirect_or_verifier');
           await db.query('ROLLBACK');
           return oauthError(res, 400, 'invalid_request');
         }
+        logOAuthTokenTrace('token_request_validation', 'required_parameters_present');
 
+        diagnosticStage = 'token_code_lookup';
         const found = await db.query(
           `SELECT *
              FROM andro.oauth_authorization_codes
             WHERE code_hash = $1
             FOR UPDATE`,
           [sha256(code)],
+        );
+
+        logOAuthTokenTrace(
+          'token_code_lookup',
+          found.rowCount === 1 ? 'found' : 'not_found',
         );
 
         if (found.rowCount !== 1) {
@@ -938,37 +977,86 @@ export function createOAuthRouter(): Router {
 
         const row = found.rows[0];
 
+        diagnosticStage = 'token_code_validation';
+        if (row.consumed_at) {
+          logOAuthTokenTrace('token_code_validation', 'already_consumed');
+          await db.query('ROLLBACK');
+          return oauthError(res, 400, 'invalid_grant');
+        }
+
+        if (new Date(row.expires_at).getTime() <= Date.now()) {
+          logOAuthTokenTrace('token_code_validation', 'expired');
+          await db.query('ROLLBACK');
+          return oauthError(res, 400, 'invalid_grant');
+        }
+        logOAuthTokenTrace('token_code_validation', 'unused_and_unexpired');
+
+        diagnosticStage = 'token_client_validation';
+        if (row.client_id !== clientId) {
+          logOAuthTokenTrace('token_client_validation', 'client_id_mismatch');
+          await db.query('ROLLBACK');
+          return oauthError(res, 400, 'invalid_grant');
+        }
+        logOAuthTokenTrace('token_client_validation', 'matched');
+
+        diagnosticStage = 'token_redirect_validation';
+        if (row.redirect_uri !== redirectUri) {
+          logOAuthTokenTrace('token_redirect_validation', 'redirect_uri_mismatch');
+          await db.query('ROLLBACK');
+          return oauthError(res, 400, 'invalid_grant');
+        }
+        logOAuthTokenTrace('token_redirect_validation', 'matched');
+
+        diagnosticStage = 'token_resource_validation';
+        if (row.resource !== resource) {
+          logOAuthTokenTrace('token_resource_validation', 'stored_resource_mismatch');
+          await db.query('ROLLBACK');
+          return oauthError(res, 400, 'invalid_grant');
+        }
+        logOAuthTokenTrace('token_resource_validation', 'stored_resource_matched');
+
+        diagnosticStage = 'token_pkce_validation';
         const verifierChallenge = createHash('sha256')
           .update(verifier)
           .digest('base64url');
 
         if (
-          row.consumed_at ||
-          new Date(row.expires_at).getTime() <= Date.now() ||
-          row.client_id !== clientId ||
-          row.redirect_uri !== redirectUri ||
-          row.resource !== resource ||
+          typeof row.code_challenge !== 'string' ||
           !safeEqual(row.code_challenge, verifierChallenge)
         ) {
+          logOAuthTokenTrace('token_pkce_validation', 'mismatch');
           await db.query('ROLLBACK');
           return oauthError(res, 400, 'invalid_grant');
         }
+        logOAuthTokenTrace('token_pkce_validation', 'matched');
 
-        await db.query(
+        diagnosticStage = 'token_code_consumption';
+        const consumed = await db.query(
           `UPDATE andro.oauth_authorization_codes
               SET consumed_at = now()
-            WHERE code_hash = $1 AND consumed_at IS NULL`,
+            WHERE code_hash = $1 AND consumed_at IS NULL
+            RETURNING code_hash`,
           [sha256(code)],
         );
 
+        if (consumed.rowCount !== 1) {
+          logOAuthTokenTrace('token_code_consumption', 'not_consumed');
+          await db.query('ROLLBACK');
+          return oauthError(res, 400, 'invalid_grant');
+        }
+        logOAuthTokenTrace('token_code_consumption', 'consumed');
+
+        diagnosticStage = 'token_pair_creation';
         const tokenPair = await insertTokenPair(
           db,
           clientId,
           row.scopes as OAuthScope[],
           resource,
         );
+        logOAuthTokenTrace('token_pair_creation', 'pair_inserted_pending_commit');
 
         await db.query('COMMIT');
+        logOAuthTokenTrace('token_pair_creation', 'committed');
         setNoStore(res);
         return res.json(tokenPair);
       }
@@ -1063,6 +1151,7 @@ export function createOAuthRouter(): Router {
       await db.query('ROLLBACK');
       return oauthError(res, 400, 'unsupported_grant_type');
     } catch {
+      logOAuthTokenTrace(diagnosticStage, 'database_or_runtime_error');
       try {
         await db.query('ROLLBACK');
       } catch {
