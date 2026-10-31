@@ -1,3 +1,4 @@
+
 import express, {
   type Request,
   type Response,
@@ -117,6 +118,20 @@ function oauthError(
 function setNoStore(res: Response) {
   res.set('Cache-Control', 'no-store');
   res.set('Pragma', 'no-cache');
+}
+
+type ConsentFailureReason =
+  | 'transaction_missing'
+  | 'transaction_expired'
+  | 'github_authentication_missing'
+  | 'nonce_mismatch';
+
+function logConsentValidationFailure(
+  stage: 'page' | 'submit',
+  reason: ConsentFailureReason,
+) {
+  // Never log OAuth state, nonce, authorization codes, or bearer tokens.
+  console.warn('[oauth] consent validation failed', { stage, reason });
 }
 
 function isGithubOAuthConfigured(): boolean {
@@ -559,25 +574,37 @@ export function createOAuthRouter(): Router {
       }
 
       const result = await pool.query(
-        `SELECT t.client_id, t.redirect_uri, t.scopes,
-                t.github_user_id, t.github_login, t.consent_nonce_hash,
-                c.client_name
+        `SELECT t.client_id, t.redirect_uri, t.scopes, t.expires_at,
+                t.authenticated_at, t.github_user_id, t.github_login,
+                t.consent_nonce_hash, c.client_name
            FROM andro.oauth_login_transactions AS t
            JOIN andro.oauth_clients AS c ON c.client_id = t.client_id
-          WHERE t.state_hash = $1
-            AND t.expires_at > now()
-            AND t.authenticated_at IS NOT NULL`,
+          WHERE t.state_hash = $1`,
         [sha256(state)],
       );
 
-      if (
-        result.rowCount !== 1 ||
-        !safeEqual(result.rows[0].consent_nonce_hash, sha256(nonce))
-      ) {
+      if (result.rowCount !== 1) {
+        logConsentValidationFailure('page', 'transaction_missing');
         return res.status(400).send('This consent request is invalid or has expired.');
       }
 
       const row = result.rows[0];
+      if (new Date(row.expires_at).getTime() <= Date.now()) {
+        logConsentValidationFailure('page', 'transaction_expired');
+        return res.status(400).send('This consent request is invalid or has expired.');
+      }
+      if (!row.authenticated_at) {
+        logConsentValidationFailure('page', 'github_authentication_missing');
+        return res.status(400).send('This consent request is invalid or has expired.');
+      }
+      if (
+        typeof row.consent_nonce_hash !== 'string' ||
+        !safeEqual(row.consent_nonce_hash, sha256(nonce))
+      ) {
+        logConsentValidationFailure('page', 'nonce_mismatch');
+        return res.status(400).send('This consent request is invalid or has expired.');
+      }
+
       const clientName = htmlEscape(String(row.client_name));
       const githubLogin = htmlEscape(String(row.github_login));
       const scopeLabels = (row.scopes as string[])
@@ -619,21 +646,36 @@ export function createOAuthRouter(): Router {
            FROM andro.oauth_login_transactions AS t
            JOIN andro.oauth_clients AS c ON c.client_id = t.client_id
           WHERE t.state_hash = $1
-            AND t.expires_at > now()
-            AND t.authenticated_at IS NOT NULL
           FOR UPDATE OF t`,
         [sha256(state)],
       );
 
-      if (
-        found.rowCount !== 1 ||
-        !safeEqual(found.rows[0].consent_nonce_hash, sha256(nonce))
-      ) {
+      if (found.rowCount !== 1) {
         await db.query('ROLLBACK');
+        logConsentValidationFailure('submit', 'transaction_missing');
         return res.status(400).send('This consent request is invalid or has expired.');
       }
 
       const row = found.rows[0];
+      if (new Date(row.expires_at).getTime() <= Date.now()) {
+        await db.query('ROLLBACK');
+        logConsentValidationFailure('submit', 'transaction_expired');
+        return res.status(400).send('This consent request is invalid or has expired.');
+      }
+      if (!row.authenticated_at) {
+        await db.query('ROLLBACK');
+        logConsentValidationFailure('submit', 'github_authentication_missing');
+        return res.status(400).send('This consent request is invalid or has expired.');
+      }
+      if (
+        typeof row.consent_nonce_hash !== 'string' ||
+        !safeEqual(row.consent_nonce_hash, sha256(nonce))
+      ) {
+        await db.query('ROLLBACK');
+        logConsentValidationFailure('submit', 'nonce_mismatch');
+        return res.status(400).send('This consent request is invalid or has expired.');
+      }
+
       const owner = await db.query(
         `SELECT provider_user_id
            FROM andro.oauth_authorized_principal
