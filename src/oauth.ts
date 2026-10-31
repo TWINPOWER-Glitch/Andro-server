@@ -134,6 +134,56 @@ function logConsentValidationFailure(
   console.warn('[oauth] consent validation failed', { stage, reason });
 }
 
+/*
+ * Diagnostic fingerprint of the configured PostgreSQL target.
+ * This deliberately excludes usernames, passwords, query parameters,
+ * and the original database connection URL.
+ */
+function oauthDatabaseTargetFingerprint(): string {
+  const candidates = [
+    process.env.DATABASE_URL,
+    process.env.SUPABAS_POSTGRES_URL,
+    process.env.SUPABAS_POSTGRES_PRISMA_URL,
+    process.env.SUPABAS_POSTGRES_URL_NON_POOLING,
+  ];
+
+  const connectionString = candidates.find(
+    (value): value is string =>
+      typeof value === 'string' &&
+      /^postgres(?:ql)?:\/\//i.test(value.trim()),
+  );
+
+  if (!connectionString) return 'unavailable';
+
+  try {
+    const parsed = new URL(connectionString.trim());
+
+    return createHash('sha256')
+      .update(parsed.hostname + parsed.pathname)
+      .digest('hex')
+      .slice(0, 12);
+  } catch {
+    return 'unavailable';
+  }
+}
+
+function logLoginTransactionTrace(
+  stage:
+    | 'authorize_create'
+    | 'github_callback_lookup'
+    | 'github_identity_update'
+    | 'consent_page_lookup'
+    | 'consent_submit_lookup',
+  outcome: string,
+) {
+  // Never log OAuth state, nonce, authorization codes, or bearer tokens.
+  console.info('[oauth] login transaction trace', {
+    stage,
+    outcome,
+    database: oauthDatabaseTargetFingerprint(),
+  });
+}
+
 function isGithubOAuthConfigured(): boolean {
   return Boolean(
     process.env.GITHUB_CLIENT_ID?.trim() &&
@@ -414,12 +464,14 @@ export function createOAuthRouter(): Router {
       );
 
       const loginState = randomSecret();
-      await pool.query(
+
+      const createdTransaction = await pool.query(
         `INSERT INTO andro.oauth_login_transactions
            (state_hash, client_id, redirect_uri, client_state,
             code_challenge, scopes, resource, expires_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7,
-                 now() + ($8 * interval '1 second'))`,
+                 now() + ($8 * interval '1 second'))
+         RETURNING state_hash`,
         [
           sha256(loginState),
           clientId,
@@ -431,6 +483,15 @@ export function createOAuthRouter(): Router {
           LOGIN_TRANSACTION_TTL_SECONDS,
         ],
       );
+
+      logLoginTransactionTrace(
+        'authorize_create',
+        createdTransaction.rowCount === 1 ? 'created' : 'insert_not_confirmed',
+      );
+
+      if (createdTransaction.rowCount !== 1) {
+        throw new Error('OAuth login transaction insert was not confirmed.');
+      }
 
       const githubUrl = new URL('https://github.com/login/oauth/authorize');
       githubUrl.searchParams.set('client_id', process.env.GITHUB_CLIENT_ID!.trim());
@@ -464,7 +525,34 @@ export function createOAuthRouter(): Router {
         [sha256(state)],
       );
 
+      logLoginTransactionTrace(
+        'github_callback_lookup',
+        transaction.rowCount === 1
+          ? 'found_eligible_transaction'
+          : 'eligible_transaction_not_found',
+      );
+
       if (transaction.rowCount !== 1) {
+        const diagnostic = await pool.query(
+          `SELECT expires_at, authenticated_at
+             FROM andro.oauth_login_transactions
+            WHERE state_hash = $1`,
+          [sha256(state)],
+        );
+
+        const diagnosticRow = diagnostic.rows[0];
+
+        const reason =
+          !diagnosticRow
+            ? 'missing'
+            : new Date(diagnosticRow.expires_at).getTime() <= Date.now()
+              ? 'expired'
+              : diagnosticRow.authenticated_at
+                ? 'already_authenticated'
+                : 'eligibility_filter_mismatch';
+
+        logLoginTransactionTrace('github_callback_lookup', reason);
+
         return res.status(400).send('This login request has expired. Restart the Claude connection.');
       }
 
@@ -520,8 +608,10 @@ export function createOAuthRouter(): Router {
         id?: number;
         login?: string;
       };
+
       const githubUserId =
         typeof githubUser.id === 'number' ? String(githubUser.id) : '';
+
       const githubLogin =
         typeof githubUser.login === 'string' ? githubUser.login : '';
 
@@ -530,6 +620,7 @@ export function createOAuthRouter(): Router {
       }
 
       const isOwner = await ownerMatchesGithubUser(githubUserId, githubLogin);
+
       if (!isOwner) {
         await pool.query(
           `DELETE FROM andro.oauth_login_transactions WHERE state_hash = $1`,
@@ -539,6 +630,7 @@ export function createOAuthRouter(): Router {
       }
 
       const consentNonce = randomSecret();
+
       const updated = await pool.query(
         `UPDATE andro.oauth_login_transactions
             SET github_user_id = $2,
@@ -552,13 +644,39 @@ export function createOAuthRouter(): Router {
         [sha256(state), githubUserId, githubLogin, sha256(consentNonce)],
       );
 
+      logLoginTransactionTrace(
+        'github_identity_update',
+        updated.rowCount === 1 ? 'updated' : 'update_not_applied',
+      );
+
       if (updated.rowCount !== 1) {
+        const diagnostic = await pool.query(
+          `SELECT expires_at, authenticated_at
+             FROM andro.oauth_login_transactions
+            WHERE state_hash = $1`,
+          [sha256(state)],
+        );
+
+        const diagnosticRow = diagnostic.rows[0];
+
+        const reason =
+          !diagnosticRow
+            ? 'missing'
+            : new Date(diagnosticRow.expires_at).getTime() <= Date.now()
+              ? 'expired'
+              : diagnosticRow.authenticated_at
+                ? 'already_authenticated'
+                : 'update_filter_mismatch';
+
+        logLoginTransactionTrace('github_identity_update', reason);
+
         return res.status(400).send('This login request has expired. Restart the Claude connection.');
       }
 
       const consentUrl = new URL('/oauth/consent', OAUTH_ISSUER);
       consentUrl.searchParams.set('state', state);
       consentUrl.searchParams.set('nonce', consentNonce);
+
       return res.redirect(302, consentUrl.toString());
     } catch {
       return res.status(500).send('Andro could not complete GitHub sign-in.');
@@ -569,6 +687,7 @@ export function createOAuthRouter(): Router {
     try {
       const state = stringValue(req.query.state);
       const nonce = stringValue(req.query.nonce);
+
       if (!state || !nonce || state.length > 512 || nonce.length > 512) {
         return res.status(400).send('Invalid consent request.');
       }
@@ -583,20 +702,28 @@ export function createOAuthRouter(): Router {
         [sha256(state)],
       );
 
+      logLoginTransactionTrace(
+        'consent_page_lookup',
+        result.rowCount === 1 ? 'found' : 'not_found',
+      );
+
       if (result.rowCount !== 1) {
         logConsentValidationFailure('page', 'transaction_missing');
         return res.status(400).send('This consent request is invalid or has expired.');
       }
 
       const row = result.rows[0];
+
       if (new Date(row.expires_at).getTime() <= Date.now()) {
         logConsentValidationFailure('page', 'transaction_expired');
         return res.status(400).send('This consent request is invalid or has expired.');
       }
+
       if (!row.authenticated_at) {
         logConsentValidationFailure('page', 'github_authentication_missing');
         return res.status(400).send('This consent request is invalid or has expired.');
       }
+
       if (
         typeof row.consent_nonce_hash !== 'string' ||
         !safeEqual(row.consent_nonce_hash, sha256(nonce))
@@ -607,6 +734,7 @@ export function createOAuthRouter(): Router {
 
       const clientName = htmlEscape(String(row.client_name));
       const githubLogin = htmlEscape(String(row.github_login));
+
       const scopeLabels = (row.scopes as string[])
         .map((scope) =>
           scope === 'mcp:build'
@@ -618,6 +746,7 @@ export function createOAuthRouter(): Router {
       res.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
       res.set('Referrer-Policy', 'no-referrer');
       res.set('Cache-Control', 'no-store');
+
       return res.type('html').send(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Andro</title>
 <style>body{font:16px system-ui,sans-serif;background:#111;color:#f5f5f5;max-width:560px;margin:8vh auto;padding:24px}main{border:1px solid #444;border-radius:16px;padding:24px}h1{font-size:24px}li{margin:12px 0}button{padding:12px 18px;border:0;border-radius:8px;font-weight:600;margin:12px 8px 0 0;cursor:pointer}.approve{background:#fff;color:#111}.deny{background:#333;color:#fff}small{color:#aaa}</style></head>
@@ -638,9 +767,11 @@ export function createOAuthRouter(): Router {
     }
 
     let db: any;
+
     try {
       db = await pool.connect();
       await db.query('BEGIN');
+
       const found = await db.query(
         `SELECT t.*, c.redirect_uris
            FROM andro.oauth_login_transactions AS t
@@ -650,6 +781,11 @@ export function createOAuthRouter(): Router {
         [sha256(state)],
       );
 
+      logLoginTransactionTrace(
+        'consent_submit_lookup',
+        found.rowCount === 1 ? 'found' : 'not_found',
+      );
+
       if (found.rowCount !== 1) {
         await db.query('ROLLBACK');
         logConsentValidationFailure('submit', 'transaction_missing');
@@ -657,16 +793,19 @@ export function createOAuthRouter(): Router {
       }
 
       const row = found.rows[0];
+
       if (new Date(row.expires_at).getTime() <= Date.now()) {
         await db.query('ROLLBACK');
         logConsentValidationFailure('submit', 'transaction_expired');
         return res.status(400).send('This consent request is invalid or has expired.');
       }
+
       if (!row.authenticated_at) {
         await db.query('ROLLBACK');
         logConsentValidationFailure('submit', 'github_authentication_missing');
         return res.status(400).send('This consent request is invalid or has expired.');
       }
+
       if (
         typeof row.consent_nonce_hash !== 'string' ||
         !safeEqual(row.consent_nonce_hash, sha256(nonce))
@@ -697,14 +836,20 @@ export function createOAuthRouter(): Router {
 
       if (decision !== 'approve') {
         await db.query('COMMIT');
+
         const denied = new URL(String(row.redirect_uri));
         denied.searchParams.set('error', 'access_denied');
         denied.searchParams.set('iss', OAUTH_ISSUER);
-        if (row.client_state) denied.searchParams.set('state', String(row.client_state));
+
+        if (row.client_state) {
+          denied.searchParams.set('state', String(row.client_state));
+        }
+
         return res.redirect(302, denied.toString());
       }
 
       const authorizationCode = randomSecret();
+
       await db.query(
         `INSERT INTO andro.oauth_authorization_codes
            (code_hash, client_id, redirect_uri, code_challenge,
@@ -727,12 +872,21 @@ export function createOAuthRouter(): Router {
       const callback = new URL(String(row.redirect_uri));
       callback.searchParams.set('code', authorizationCode);
       callback.searchParams.set('iss', OAUTH_ISSUER);
-      if (row.client_state) callback.searchParams.set('state', String(row.client_state));
+
+      if (row.client_state) {
+        callback.searchParams.set('state', String(row.client_state));
+      }
+
       return res.redirect(302, callback.toString());
     } catch {
       if (db) {
-        try { await db.query('ROLLBACK'); } catch { /* ignore rollback failure */ }
+        try {
+          await db.query('ROLLBACK');
+        } catch {
+          /* ignore rollback failure */
+        }
       }
+
       return res.status(500).send('Andro could not complete the authorization.');
     } finally {
       db?.release();
@@ -750,6 +904,7 @@ export function createOAuthRouter(): Router {
     }
 
     let db: any;
+
     try {
       db = await pool.connect();
       await db.query('BEGIN');
@@ -782,6 +937,7 @@ export function createOAuthRouter(): Router {
         }
 
         const row = found.rows[0];
+
         const verifierChallenge = createHash('sha256')
           .update(verifier)
           .digest('base64url');
@@ -811,6 +967,7 @@ export function createOAuthRouter(): Router {
           row.scopes as OAuthScope[],
           resource,
         );
+
         await db.query('COMMIT');
         setNoStore(res);
         return res.json(tokenPair);
@@ -818,6 +975,7 @@ export function createOAuthRouter(): Router {
 
       if (grantType === 'refresh_token') {
         const refreshToken = stringValue(body.refresh_token);
+
         if (!refreshToken) {
           await db.query('ROLLBACK');
           return oauthError(res, 400, 'invalid_request');
@@ -845,12 +1003,14 @@ export function createOAuthRouter(): Router {
               WHERE token_family_id = $1`,
             [row.token_family_id],
           );
+
           await db.query(
             `UPDATE andro.oauth_access_tokens
                 SET revoked_at = COALESCE(revoked_at, now())
               WHERE client_id = $1`,
             [row.client_id],
           );
+
           await db.query('COMMIT');
           return oauthError(res, 400, 'invalid_grant');
         }
@@ -866,8 +1026,12 @@ export function createOAuthRouter(): Router {
         }
 
         const requestedScopes =
-          body.scope === undefined ? (row.scopes as OAuthScope[]) : parseScopes(body.scope);
+          body.scope === undefined
+            ? (row.scopes as OAuthScope[])
+            : parseScopes(body.scope);
+
         const existingScopes = row.scopes as string[];
+
         if (
           !requestedScopes ||
           requestedScopes.some((scope) => !existingScopes.includes(scope))
@@ -890,6 +1054,7 @@ export function createOAuthRouter(): Router {
           resource,
           row.token_family_id,
         );
+
         await db.query('COMMIT');
         setNoStore(res);
         return res.json(tokenPair);
@@ -903,6 +1068,7 @@ export function createOAuthRouter(): Router {
       } catch {
         // The transaction may already have been rolled back.
       }
+
       return oauthError(res, 500, 'server_error');
     } finally {
       db?.release();
@@ -911,6 +1077,7 @@ export function createOAuthRouter(): Router {
 
   router.post('/oauth/revoke', async (req, res) => {
     const token = stringValue(req.body?.token);
+
     if (!token) {
       setNoStore(res);
       return res.status(200).end();
@@ -918,9 +1085,11 @@ export function createOAuthRouter(): Router {
 
     const tokenHash = sha256(token);
     let db: any;
+
     try {
       db = await pool.connect();
       await db.query('BEGIN');
+
       const access = await db.query(
         `UPDATE andro.oauth_access_tokens
             SET revoked_at = COALESCE(revoked_at, now())
@@ -945,6 +1114,7 @@ export function createOAuthRouter(): Router {
               WHERE token_family_id = $1`,
             [refresh.rows[0].token_family_id],
           );
+
           await db.query(
             `UPDATE andro.oauth_access_tokens
                 SET revoked_at = COALESCE(revoked_at, now())
@@ -959,8 +1129,13 @@ export function createOAuthRouter(): Router {
       return res.status(200).end();
     } catch {
       if (db) {
-        try { await db.query('ROLLBACK'); } catch { /* ignore rollback failure */ }
+        try {
+          await db.query('ROLLBACK');
+        } catch {
+          /* ignore rollback failure */
+        }
       }
+
       return oauthError(res, 500, 'server_error');
     } finally {
       db?.release();
