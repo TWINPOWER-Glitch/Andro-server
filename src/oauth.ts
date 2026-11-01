@@ -778,7 +778,13 @@ export function createOAuthRouter(): Router {
         )
         .join('');
 
-      res.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+      // A fresh nonce authorizes only the script served with this consent page.
+      const consentScriptNonce = randomBytes(18).toString('base64');
+
+      res.set(
+        'Content-Security-Policy',
+        `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${consentScriptNonce}'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
+      );
       res.set('Referrer-Policy', 'no-referrer');
       res.set('Cache-Control', 'no-store');
 
@@ -786,7 +792,37 @@ export function createOAuthRouter(): Router {
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Andro</title>
 <style>body{font:16px system-ui,sans-serif;background:#111;color:#f5f5f5;max-width:560px;margin:8vh auto;padding:24px}main{border:1px solid #444;border-radius:16px;padding:24px}h1{font-size:24px}li{margin:12px 0}button{padding:12px 18px;border:0;border-radius:8px;font-weight:600;margin:12px 8px 0 0;cursor:pointer}.approve{background:#fff;color:#111}.deny{background:#333;color:#fff}small{color:#aaa}</style></head>
 <body><main><h1>Authorize Andro</h1><p><strong>${clientName}</strong> is requesting access to your Andro server.</p><p>Signed in as GitHub account <strong>${githubLogin}</strong>.</p><ul>${scopeLabels}</ul><p>Only the authorized Andro owner can approve this connection. You can revoke access later.</p>
-<form method="post" action="/oauth/consent"><input type="hidden" name="state" value="${htmlEscape(state)}"><input type="hidden" name="nonce" value="${htmlEscape(nonce)}"><button class="approve" name="decision" value="approve">Approve access</button><button class="deny" name="decision" value="deny">Deny</button></form><p><small>Andro never receives access to your GitHub repositories through this sign-in. GitHub is used only to verify your account identity.</small></p></main></body></html>`);
+<form id="andro-consent-form" method="post" action="/oauth/consent"><input type="hidden" name="state" value="${htmlEscape(state)}"><input type="hidden" name="nonce" value="${htmlEscape(nonce)}"><button class="approve" name="decision" value="approve">Approve access</button><button class="deny" name="decision" value="deny">Deny</button></form><p><small>Andro never receives access to your GitHub repositories through this sign-in. GitHub is used only to verify your account identity.</small></p></main>
+<script nonce="${consentScriptNonce}">
+(() => {
+  const form = document.getElementById('andro-consent-form');
+  if (!form) return;
+
+  let submitted = false;
+
+  form.addEventListener('submit', (event) => {
+    if (submitted) {
+      event.preventDefault();
+      return;
+    }
+
+    submitted = true;
+
+    const submitter = event.submitter;
+
+    for (const button of form.querySelectorAll('button')) {
+      if (button !== submitter) {
+        button.disabled = true;
+      }
+    }
+
+    if (submitter) {
+      submitter.textContent = 'Processing…';
+    }
+  });
+})();
+</script>
+</body></html>`);
     } catch {
       return res.status(500).send('Could not load the consent page.');
     }
