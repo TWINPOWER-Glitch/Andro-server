@@ -200,6 +200,25 @@ function logOAuthTokenTrace(stage: string, outcome: string) {
   });
 }
 
+/*
+ * Consent handoff diagnostics. Destination details are restricted to
+ * hostname and pathname; query strings can contain OAuth codes and state.
+ */
+function logConsentHandoffTrace(
+  stage: string,
+  outcome: string,
+  destination?: URL,
+) {
+  console.info('[oauth] consent handoff trace', {
+    stage,
+    outcome,
+    database: oauthDatabaseTargetFingerprint(),
+    ...(destination
+      ? { destination: { hostname: destination.hostname, pathname: destination.pathname } }
+      : {}),
+  });
+}
+
 function isGithubOAuthConfigured(): boolean {
   return Boolean(
     process.env.GITHUB_CLIENT_ID?.trim() &&
@@ -783,6 +802,7 @@ export function createOAuthRouter(): Router {
     }
 
     let db: any;
+    let consentStage = 'database_connection';
 
     try {
       db = await pool.connect();
@@ -845,13 +865,20 @@ export function createOAuthRouter(): Router {
         return res.status(403).send('The authorized Andro owner has changed.');
       }
 
-      await db.query(
+      consentStage = 'transaction_delete';
+      const deletedTransaction = await db.query(
         `DELETE FROM andro.oauth_login_transactions WHERE state_hash = $1`,
         [sha256(state)],
       );
+      logConsentHandoffTrace(
+        'transaction_delete',
+        deletedTransaction.rowCount === 1 ? 'deleted' : 'delete_not_confirmed',
+      );
 
       if (decision !== 'approve') {
+        consentStage = 'denial_commit';
         await db.query('COMMIT');
+        logConsentHandoffTrace('denial_commit', 'committed');
 
         const denied = new URL(String(row.redirect_uri));
         denied.searchParams.set('error', 'access_denied');
@@ -861,12 +888,15 @@ export function createOAuthRouter(): Router {
           denied.searchParams.set('state', String(row.client_state));
         }
 
-        return res.redirect(302, denied.toString());
+        const denialResponse = res.redirect(302, denied.toString());
+        logConsentHandoffTrace('denial_redirect_response', `status_${res.statusCode}`, denied);
+        return denialResponse;
       }
 
       const authorizationCode = randomSecret();
 
-      await db.query(
+      consentStage = 'authorization_code_insert';
+      const insertedCode = await db.query(
         `INSERT INTO andro.oauth_authorization_codes
            (code_hash, client_id, redirect_uri, code_challenge,
             code_challenge_method, scopes, resource, expires_at)
@@ -882,9 +912,16 @@ export function createOAuthRouter(): Router {
           AUTHORIZATION_CODE_TTL_SECONDS,
         ],
       );
+      logConsentHandoffTrace(
+        'authorization_code_insert',
+        insertedCode.rowCount === 1 ? 'inserted' : 'insert_not_confirmed',
+      );
 
+      consentStage = 'approval_commit';
       await db.query('COMMIT');
+      logConsentHandoffTrace('approval_commit', 'committed');
 
+      consentStage = 'callback_redirect_construction';
       const callback = new URL(String(row.redirect_uri));
       callback.searchParams.set('code', authorizationCode);
       callback.searchParams.set('iss', OAUTH_ISSUER);
@@ -892,9 +929,18 @@ export function createOAuthRouter(): Router {
       if (row.client_state) {
         callback.searchParams.set('state', String(row.client_state));
       }
+      logConsentHandoffTrace('callback_redirect_construction', 'constructed', callback);
 
-      return res.redirect(302, callback.toString());
+      consentStage = 'callback_redirect_response';
+      const callbackResponse = res.redirect(302, callback.toString());
+      logConsentHandoffTrace(
+        'callback_redirect_response',
+        `status_${res.statusCode}`,
+        callback,
+      );
+      return callbackResponse;
     } catch {
+      logConsentHandoffTrace('consent_failure', consentStage);
       if (db) {
         try {
           await db.query('ROLLBACK');
