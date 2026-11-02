@@ -204,10 +204,6 @@ function logOAuthTokenTrace(stage: string, outcome: string) {
  * Consent handoff diagnostics. Destination details are restricted to
  * hostname and pathname; query strings can contain OAuth codes and state.
  */
-/*
- * Consent handoff diagnostics. Destination details are restricted to
- * hostname and pathname; query strings can contain OAuth codes and state.
- */
 function logConsentHandoffTrace(
   stage: string,
   outcome: string,
@@ -981,7 +977,7 @@ export function createOAuthRouter(): Router {
       if (row.client_state) {
         callback.searchParams.set('state', String(row.client_state));
       }
-            const callbackFacts = {
+      const callbackFacts = {
         issuer: OAUTH_ISSUER,
         statePresent: Boolean(row.client_state),
         authorizationCodePresent: Boolean(authorizationCode),
