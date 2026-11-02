@@ -204,18 +204,34 @@ function logOAuthTokenTrace(stage: string, outcome: string) {
  * Consent handoff diagnostics. Destination details are restricted to
  * hostname and pathname; query strings can contain OAuth codes and state.
  */
+/*
+ * Consent handoff diagnostics. Destination details are restricted to
+ * hostname and pathname; query strings can contain OAuth codes and state.
+ */
 function logConsentHandoffTrace(
   stage: string,
   outcome: string,
   destination?: URL,
+  callbackFacts?: {
+    issuer?: string;
+    statePresent?: boolean;
+    authorizationCodePresent?: boolean;
+    httpStatus?: number;
+  },
 ) {
   console.info('[oauth] consent handoff trace', {
     stage,
     outcome,
     database: oauthDatabaseTargetFingerprint(),
     ...(destination
-      ? { destination: { hostname: destination.hostname, pathname: destination.pathname } }
+      ? {
+          destination: {
+            hostname: destination.hostname,
+            pathname: destination.pathname,
+          },
+        }
       : {}),
+    ...(callbackFacts ? { callbackFacts } : {}),
   });
 }
 
