@@ -968,7 +968,7 @@ export function createOAuthRouter(): Router {
       logConsentHandoffTrace('callback_redirect_construction', 'constructed', callback);
 
       consentStage = 'callback_redirect_response';
-      const callbackResponse = res.redirect(302, callback.toString());
+      const callbackResponse = res.redirect(303, callback.toString());
       logConsentHandoffTrace(
         'callback_redirect_response',
         `status_${res.statusCode}`,
