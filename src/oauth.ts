@@ -965,7 +965,18 @@ export function createOAuthRouter(): Router {
       if (row.client_state) {
         callback.searchParams.set('state', String(row.client_state));
       }
-      logConsentHandoffTrace('callback_redirect_construction', 'constructed', callback);
+            const callbackFacts = {
+        issuer: OAUTH_ISSUER,
+        statePresent: Boolean(row.client_state),
+        authorizationCodePresent: Boolean(authorizationCode),
+      };
+
+      logConsentHandoffTrace(
+        'callback_redirect_construction',
+        'constructed',
+        callback,
+        callbackFacts,
+      );
 
       consentStage = 'callback_redirect_response';
       const callbackResponse = res.redirect(303, callback.toString());
@@ -973,6 +984,7 @@ export function createOAuthRouter(): Router {
         'callback_redirect_response',
         `status_${res.statusCode}`,
         callback,
+        { ...callbackFacts, httpStatus: res.statusCode },
       );
       return callbackResponse;
     } catch {
