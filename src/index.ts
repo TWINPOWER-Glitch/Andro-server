@@ -453,6 +453,121 @@ function mcpHasScope(
   return Array.isArray(scopes) && scopes.includes(scope);
 }
 
+// Protected, read-only database diagnostic. This exposes metadata only; it never
+// returns credentials, owner records, OAuth tokens, authorization codes, or rows.
+app.get('/v1/diagnostics/database', apiKey, async (_req, res) => {
+  const requiredTables = [
+    'oauth_authorized_principal',
+    'oauth_clients',
+    'oauth_authorization_codes',
+    'oauth_access_tokens',
+    'oauth_refresh_tokens',
+    'oauth_login_transactions',
+  ];
+
+  const databaseUrlCandidates = [
+    process.env.DATABASE_URL,
+    process.env.SUPABAS_POSTGRES_URL,
+    process.env.SUPABAS_POSTGRES_PRISMA_URL,
+    process.env.SUPABAS_POSTGRES_URL_NON_POOLING,
+  ];
+
+  let databaseHost: string | null = null;
+
+  for (const candidate of databaseUrlCandidates) {
+    if (!candidate) continue;
+
+    try {
+      const parsed = new URL(candidate);
+
+      if (
+        (parsed.protocol === 'postgres:' ||
+          parsed.protocol === 'postgresql:') &&
+        parsed.hostname
+      ) {
+        databaseHost = parsed.hostname;
+        break;
+      }
+    } catch {
+      // Ignore malformed candidates and follow store.ts precedence.
+    }
+  }
+
+  try {
+    const result = await pool.query<{
+      database_name: string;
+      schema_name: string;
+      table_name: string;
+    }>(
+      `SELECT
+         current_database() AS database_name,
+         current_schema() AS schema_name,
+         table_name
+       FROM information_schema.tables
+       WHERE table_schema = 'andro'
+         AND table_type = 'BASE TABLE'
+         AND table_name = ANY($1::text[])`,
+      [requiredTables],
+    );
+
+    const presentTables = result.rows
+      .map((row) => row.table_name)
+      .filter((name) => requiredTables.includes(name));
+    const missingTables = requiredTables.filter(
+      (name) => !presentTables.includes(name),
+    );
+
+    const identity = (await pool.query<{
+      database_name: string;
+      schema_name: string;
+    }>(
+      'SELECT current_database() AS database_name, current_schema() AS schema_name',
+    )).rows[0];
+
+    return res.json({
+      service: 'andro-server',
+      status: missingTables.length === 0 ? 'ok' : 'incomplete',
+      readOnly: true,
+      database: {
+        host: databaseHost,
+        name: identity?.database_name ?? null,
+        currentSchema: identity?.schema_name ?? null,
+        oauthSchema: 'andro',
+      },
+      requiredTables,
+      presentTables,
+      missingTables,
+      allRequiredTablesPresent: missingTables.length === 0,
+      checkedAt: new Date().toISOString(),
+    });
+  } catch (error: unknown) {
+    const dbError = error as {
+      name?: string;
+      code?: string;
+    };
+
+    console.error('Protected database diagnostic failed', {
+      name:
+        typeof dbError?.name === 'string'
+          ? dbError.name
+          : 'UnknownError',
+      code:
+        typeof dbError?.code === 'string'
+          ? dbError.code
+          : 'NO_DATABASE_ERROR_CODE',
+    });
+
+    return res.status(503).json({
+      service: 'andro-server',
+      status: 'unavailable',
+      readOnly: true,
+      databaseHost,
+      error: 'Database diagnostic query failed.',
+      checkedAt: new Date().toISOString(),
+    });
+  }
+});
+
 // Health check. Never expose database connection details.
 app.get('/health', async (_req, res) => {
   try {
@@ -693,7 +808,7 @@ app.get(
       }
 
       return res.json({
-        jobId: job.id,
+        jobId: id,
         expiresInSeconds: 300,
         downloadUrl: data.signedUrl,
       });
