@@ -1,3 +1,4 @@
+
 import 'dotenv/config';
 import express, {
   type Request,
@@ -32,6 +33,12 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseSecret =
   process.env.SUPABASE_SECRET_KEY ||
   process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const supabasePublicKey =
+  process.env.SUPABASE_PUBLISHABLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  '';
+
 const artifactBucket =
   process.env.ANDRO_ARTIFACT_BUCKET || 'andro-artifacts';
 
@@ -56,6 +63,254 @@ app.use(
 );
 
 app.use(express.json({ limit: '1mb' }));
+
+// -----------------------------------------------------------------------------
+// Andro website entry
+//
+// This uses the same Andro Supabase Auth project as the Android app.
+// The public publishable/anon key is safe for client-side use when Supabase
+// Row Level Security and Auth policies are correctly configured.
+//
+// Do not use SUPABASE_SECRET_KEY or the service-role key in browser code.
+// -----------------------------------------------------------------------------
+
+function renderAndroWebsite(): string {
+  const config = JSON.stringify({
+    supabaseUrl: supabaseUrl ?? '',
+    supabasePublicKey,
+  }).replace(/</g, '\\u003c');
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Andro</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: #10131b;
+      color: #f4f6fb;
+    }
+
+    main {
+      width: min(100%, 560px);
+      padding: 36px;
+      border: 1px solid #2a3040;
+      border-radius: 20px;
+      background: #171c27;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: 2.4rem;
+    }
+
+    p {
+      color: #b9c1d2;
+      line-height: 1.6;
+    }
+
+    button {
+      margin-top: 16px;
+      border: 0;
+      border-radius: 10px;
+      padding: 13px 18px;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+      background: #e7ecf7;
+      color: #111521;
+    }
+
+    button.secondary {
+      background: #2a3040;
+      color: #f4f6fb;
+      margin-left: 8px;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+
+    #message {
+      min-height: 1.5em;
+      overflow-wrap: anywhere;
+    }
+
+    .muted {
+      font-size: 0.9rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Andro</h1>
+
+    <p>
+      One Andro account across the Android app and website.
+      Sign in securely with GitHub.
+    </p>
+
+    <div id="actions">
+      <button id="signin" type="button">Continue with GitHub</button>
+    </div>
+
+    <p id="message" role="status" aria-live="polite"></p>
+
+    <p class="muted">
+      The Android app download will be listed here when the Play Store release
+      is available.
+    </p>
+  </main>
+
+  <script type="module">
+    import { createClient } from
+      'https://esm.sh/@supabase/supabase-js@2';
+
+    const config = ${config};
+
+    const actions = document.querySelector('#actions');
+    const message = document.querySelector('#message');
+    const signInButton = document.querySelector('#signin');
+
+    if (!config.supabaseUrl || !config.supabasePublicKey) {
+      message.textContent =
+        'Website sign-in is not configured. Set SUPABASE_URL and ' +
+        'SUPABASE_PUBLISHABLE_KEY (or SUPABASE_ANON_KEY) in the deployment environment.';
+
+      signInButton.disabled = true;
+    } else {
+      const supabase = createClient(
+        config.supabaseUrl,
+        config.supabasePublicKey,
+        {
+          auth: {
+            flowType: 'pkce',
+            detectSessionInUrl: true,
+            persistSession: true,
+            autoRefreshToken: true
+          }
+        }
+      );
+
+      let rendering = false;
+
+      async function renderSession() {
+        if (rendering) return;
+        rendering = true;
+
+        try {
+          const {
+            data: { session },
+            error
+          } = await supabase.auth.getSession();
+
+          if (error) {
+            message.textContent = error.message;
+            return;
+          }
+
+          if (!session) {
+            if (location.pathname === '/auth/callback') {
+              message.textContent =
+                'Authentication did not complete. Please try signing in again.';
+            }
+
+            return;
+          }
+
+          actions.replaceChildren();
+
+          const signedIn = document.createElement('p');
+
+          const displayName =
+            session.user.user_metadata?.user_name ||
+            session.user.user_metadata?.preferred_username ||
+            session.user.email ||
+            'your GitHub account';
+
+          signedIn.textContent = 'Signed in as ' + displayName + '.';
+
+          const signOutButton = document.createElement('button');
+          signOutButton.className = 'secondary';
+          signOutButton.type = 'button';
+          signOutButton.textContent = 'Sign out';
+
+          signOutButton.addEventListener('click', async () => {
+            signOutButton.disabled = true;
+
+            const { error: signOutError } =
+              await supabase.auth.signOut();
+
+            if (signOutError) {
+              message.textContent = signOutError.message;
+              signOutButton.disabled = false;
+              return;
+            }
+
+            actions.replaceChildren(signInButton);
+            message.textContent = 'Signed out.';
+          });
+
+          actions.append(signedIn, signOutButton);
+
+          message.textContent =
+            location.pathname === '/auth/callback'
+              ? 'Authentication completed.'
+              : '';
+        } finally {
+          rendering = false;
+        }
+      }
+
+      signInButton.addEventListener('click', async () => {
+        signInButton.disabled = true;
+        message.textContent = 'Redirecting to GitHub…';
+
+        const { error } = await supabase.auth.signInWithOAuth({
+          provider: 'github',
+          options: {
+            redirectTo: location.origin + '/auth/callback'
+          }
+        });
+
+        if (error) {
+          message.textContent = error.message;
+          signInButton.disabled = false;
+        }
+      });
+
+      supabase.auth.onAuthStateChange(() => {
+        void renderSession();
+      });
+
+      void renderSession();
+    }
+  </script>
+</body>
+</html>`;
+}
+
+// Website paths only. These do not intercept /health, /v1/*, /internal/*,
+// /mcp, or the existing OAuth discovery and authorization routes.
+app.get(['/', '/auth/callback'], (_req, res) => {
+  res.type('html').send(renderAndroWebsite());
+});
 
 // OAuth discovery, registration, GitHub sign-in, consent, token,
 // refresh, and revocation endpoints. The existing API-key routes remain
@@ -136,6 +391,7 @@ const mcpAuth = async (
   if (expected) {
     const suppliedBytes = Buffer.from(provided);
     const expectedBytes = Buffer.from(expected);
+
     if (
       suppliedBytes.length === expectedBytes.length &&
       timingSafeEqual(suppliedBytes, expectedBytes)
@@ -149,11 +405,13 @@ const mcpAuth = async (
   if (!provided) {
     res.set(
       'WWW-Authenticate',
-      `Bearer realm="andro", resource_metadata="${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="mcp:read mcp:build"`,
+      \`Bearer realm="andro", resource_metadata="\${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="mcp:read mcp:build"\`,
     );
+
     return res.status(401).json({
       error: 'Unauthorized',
-      error_description: 'A valid Andro API key or OAuth access token is required.',
+      error_description:
+        'A valid Andro API key or OAuth access token is required.',
     });
   }
 
@@ -166,23 +424,32 @@ const mcpAuth = async (
     if (!authorization) {
       res.set(
         'WWW-Authenticate',
-        `Bearer realm="andro", error="invalid_token", resource_metadata="${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="mcp:read mcp:build"`,
+        \`Bearer realm="andro", error="invalid_token", resource_metadata="\${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="mcp:read mcp:build"\`,
       );
-      return res.status(401).json({ error: 'Invalid or expired access token.' });
+
+      return res.status(401).json({
+        error: 'Invalid or expired access token.',
+      });
     }
 
     res.locals.androApiKeyAuthorized = false;
     res.locals.androOAuthScopes = authorization.scopes;
     res.locals.androOAuthClientId = authorization.clientId;
+
     return next();
   } catch (error) {
     return next(error);
   }
 };
 
-function mcpHasScope(res: Response, scope: 'mcp:read' | 'mcp:build') {
+function mcpHasScope(
+  res: Response,
+  scope: 'mcp:read' | 'mcp:build',
+) {
   if (res.locals.androApiKeyAuthorized === true) return true;
+
   const scopes = res.locals.androOAuthScopes as string[] | undefined;
+
   return Array.isArray(scopes) && scopes.includes(scope);
 }
 
@@ -788,7 +1055,9 @@ app.post('/mcp', mcpAuth, async (req, res) => {
           supportedJavaVersions: ['17'],
           supportedAndroidPlatforms: ['36'],
           tools: [
-            ...(mcpHasScope(res, 'mcp:build') ? ['andro_create_build'] : []),
+            ...(mcpHasScope(res, 'mcp:build')
+              ? ['andro_create_build']
+              : []),
             'andro_get_build',
             'andro_list_builds',
             'andro_get_build_logs',
