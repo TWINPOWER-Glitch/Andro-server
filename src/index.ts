@@ -405,7 +405,7 @@ const mcpAuth = async (
   if (!provided) {
     res.set(
       'WWW-Authenticate',
-      \`Bearer realm="andro", resource_metadata="\${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="mcp:read mcp:build"\`,
+      `Bearer realm="andro", resource_metadata="${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="mcp:read mcp:build"`,
     );
 
     return res.status(401).json({
@@ -424,7 +424,7 @@ const mcpAuth = async (
     if (!authorization) {
       res.set(
         'WWW-Authenticate',
-        \`Bearer realm="andro", error="invalid_token", resource_metadata="\${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="mcp:read mcp:build"\`,
+        `Bearer realm="andro", error="invalid_token", resource_metadata="${OAUTH_ISSUER}/.well-known/oauth-protected-resource", scope="mcp:read mcp:build"`,
       );
 
       return res.status(401).json({
