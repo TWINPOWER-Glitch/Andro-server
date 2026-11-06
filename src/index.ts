@@ -477,8 +477,9 @@ app.get('/v1/diagnostics/database', apiKey, async (_req, res) => {
     ],
   ] as const;
 
+  // FIX 1: Use ordinary narrowing instead of an incompatible tuple predicate.
   const selectedDatabaseUrl = databaseUrlCandidates.find(
-    (candidate): candidate is readonly [string, string] =>
+    (candidate) =>
       typeof candidate[1] === 'string' &&
       /^postgres(?:ql)?:\/\//i.test(candidate[1].trim()),
   );
@@ -489,9 +490,12 @@ app.get('/v1/diagnostics/database', apiKey, async (_req, res) => {
   let projectMatch: 'match' | 'mismatch' | 'unverifiable' =
     'unverifiable';
 
-  if (selectedDatabaseUrl) {
+  // FIX 2: Explicitly narrow the selected URL before accessing its value.
+  const selectedDatabaseUrlValue = selectedDatabaseUrl?.[1];
+
+  if (typeof selectedDatabaseUrlValue === 'string') {
     try {
-      const parsed = new URL(selectedDatabaseUrl[1].trim());
+      const parsed = new URL(selectedDatabaseUrlValue.trim());
 
       if (
         (parsed.protocol === 'postgres:' ||
