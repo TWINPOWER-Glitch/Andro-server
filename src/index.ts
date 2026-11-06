@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import express, {
   type Request,
@@ -454,7 +453,8 @@ function mcpHasScope(
 }
 
 // Protected, read-only database diagnostic. This exposes metadata only; it never
-// returns credentials, owner records, OAuth tokens, authorization codes, or rows.
+// returns credentials, connection strings, owner records, OAuth tokens,
+// authorization codes, or database rows.
 app.get('/v1/diagnostics/database', apiKey, async (_req, res) => {
   const requiredTables = [
     'oauth_authorized_principal',
@@ -465,48 +465,95 @@ app.get('/v1/diagnostics/database', apiKey, async (_req, res) => {
     'oauth_login_transactions',
   ];
 
+  // Keep this order identical to src/store.ts. Report the selected variable,
+  // not its value, so operators can identify which configured URL is in use.
   const databaseUrlCandidates = [
-    process.env.DATABASE_URL,
-    process.env.SUPABAS_POSTGRES_URL,
-    process.env.SUPABAS_POSTGRES_PRISMA_URL,
-    process.env.SUPABAS_POSTGRES_URL_NON_POOLING,
-  ];
+    ['DATABASE_URL', process.env.DATABASE_URL],
+    ['SUPABAS_POSTGRES_URL', process.env.SUPABAS_POSTGRES_URL],
+    ['SUPABAS_POSTGRES_PRISMA_URL', process.env.SUPABAS_POSTGRES_PRISMA_URL],
+    [
+      'SUPABAS_POSTGRES_URL_NON_POOLING',
+      process.env.SUPABAS_POSTGRES_URL_NON_POOLING,
+    ],
+  ] as const;
+
+  const selectedDatabaseUrl = databaseUrlCandidates.find(
+    (candidate): candidate is readonly [string, string] =>
+      typeof candidate[1] === 'string' &&
+      /^postgres(?:ql)?:\/\//i.test(candidate[1].trim()),
+  );
 
   let databaseHost: string | null = null;
+  const databaseUrlSource: string | null =
+    selectedDatabaseUrl?.[0] ?? null;
+  let projectMatch: 'match' | 'mismatch' | 'unverifiable' =
+    'unverifiable';
 
-  for (const candidate of databaseUrlCandidates) {
-    if (!candidate) continue;
-
+  if (selectedDatabaseUrl) {
     try {
-      const parsed = new URL(candidate);
+      const parsed = new URL(selectedDatabaseUrl[1].trim());
 
       if (
         (parsed.protocol === 'postgres:' ||
           parsed.protocol === 'postgresql:') &&
         parsed.hostname
       ) {
-        databaseHost = parsed.hostname;
-        break;
+        databaseHost = parsed.hostname.toLowerCase();
+
+        const expectedProjectRef = 'pgnphlssbrphbrnkwqya';
+        const isDirectAndroHost =
+          databaseHost === 'db.' + expectedProjectRef + '.supabase.co';
+
+        // Supavisor pooler hosts are shared across projects. For those,
+        // the project ref is encoded in the PostgreSQL username
+        // (commonly postgres.<project-ref>). Compare it internally;
+        // never return the username or connection string.
+        let poolerProjectRef: string | null = null;
+
+        if (databaseHost.endsWith('.pooler.supabase.com')) {
+          try {
+            const decodedUsername = decodeURIComponent(parsed.username);
+            poolerProjectRef =
+              decodedUsername.split('.').pop()?.toLowerCase() ?? null;
+          } catch {
+            poolerProjectRef = null;
+          }
+        }
+
+        if (
+          isDirectAndroHost ||
+          poolerProjectRef === expectedProjectRef
+        ) {
+          projectMatch = 'match';
+        } else if (
+          databaseHost.endsWith('.supabase.co') ||
+          databaseHost.endsWith('.supabase.com')
+        ) {
+          projectMatch = 'mismatch';
+        }
       }
     } catch {
-      // Ignore malformed candidates and follow store.ts precedence.
+      // Do not expose malformed connection-string contents.
+      projectMatch = 'unverifiable';
     }
   }
 
+  const connectionTarget = {
+    selectedEnvironmentVariable: databaseUrlSource,
+    host: databaseHost,
+    expectedAndroProject: 'pgnphlssbrphbrnkwqya',
+    projectMatch,
+  };
+
   try {
     const result = await pool.query<{
-      database_name: string;
-      schema_name: string;
       table_name: string;
     }>(
-      `SELECT
-         current_database() AS database_name,
-         current_schema() AS schema_name,
-         table_name
-       FROM information_schema.tables
-       WHERE table_schema = 'andro'
-         AND table_type = 'BASE TABLE'
-         AND table_name = ANY($1::text[])`,
+      'SELECT table_name ' +
+        'FROM information_schema.tables ' +
+        "WHERE table_schema = 'andro' " +
+        "AND table_type = 'BASE TABLE' " +
+        'AND table_name = ANY($1::text[])',
       [requiredTables],
     );
 
@@ -517,19 +564,21 @@ app.get('/v1/diagnostics/database', apiKey, async (_req, res) => {
       (name) => !presentTables.includes(name),
     );
 
-    const identity = (await pool.query<{
-      database_name: string;
-      schema_name: string;
-    }>(
-      'SELECT current_database() AS database_name, current_schema() AS schema_name',
-    )).rows[0];
+    const identity = (
+      await pool.query<{
+        database_name: string;
+        schema_name: string;
+      }>(
+        'SELECT current_database() AS database_name, current_schema() AS schema_name',
+      )
+    ).rows[0];
 
     return res.json({
       service: 'andro-server',
       status: missingTables.length === 0 ? 'ok' : 'incomplete',
       readOnly: true,
       database: {
-        host: databaseHost,
+        ...connectionTarget,
         name: identity?.database_name ?? null,
         currentSchema: identity?.schema_name ?? null,
         oauthSchema: 'andro',
@@ -561,7 +610,7 @@ app.get('/v1/diagnostics/database', apiKey, async (_req, res) => {
       service: 'andro-server',
       status: 'unavailable',
       readOnly: true,
-      databaseHost,
+      database: connectionTarget,
       error: 'Database diagnostic query failed.',
       checkedAt: new Date().toISOString(),
     });
